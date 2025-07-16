@@ -2,6 +2,7 @@ import os
 import time
 import argparse
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 BASE_URL = "https://gw.iagon.com/api/v2"
 
@@ -70,16 +71,15 @@ def collect_all_files(root_dir):
             file_list.append((full, rel))
     return file_list
 
-def recursive_upload(local_root, visibility="private", password=None):
+def recursive_upload(local_root, visibility="private", password=None, workers=1):
     start_time = time.time()
 
-    # 获取所有文件列表
     all_files = collect_all_files(local_root)
     total_files = len(all_files)
-    print(f"\n📦 发现 {total_files} 个文件，开始上传...\n")
+    print(f"\n发现 {total_files} 个文件，开始上传...\n")
 
-    # 缓存本地相对路径到远程目录 ID 的映射
-    for i, (file_path, rel_path) in enumerate(all_files, 1):
+    # 创建远程目录（串行，保证结构唯一性）
+    for _, rel_path in all_files:
         rel_dir = os.path.dirname(rel_path)
         if rel_dir not in remote_dir_map:
             if rel_dir == ".":
@@ -89,21 +89,38 @@ def recursive_upload(local_root, visibility="private", password=None):
                 parent_id = remote_dir_map.get(parent_dir)
                 dir_id = create_remote_directory(os.path.join(local_root, rel_dir), visibility, parent_id)
             remote_dir_map[rel_dir] = dir_id
-        else:
-            dir_id = remote_dir_map[rel_dir]
 
+    def upload_task(args):
+        file_path, rel_path, idx = args
+        rel_dir = os.path.dirname(rel_path)
+        dir_id = remote_dir_map[rel_dir]
         upload_file(file_path, os.path.basename(file_path), dir_id,
-                    visibility, password, i, total_files)
-        time.sleep(0.3)  # 可根据情况调整上传节奏
+                    visibility, password, idx, total_files)
+
+    # 构造上传任务参数
+    tasks = [(file_path, rel_path, i) for i, (file_path, rel_path) in enumerate(all_files, 1)]
+
+    if workers == 1:
+        # 单线程模式
+        for args in tasks:
+            upload_task(args)
+            time.sleep(0.3)
+    else:
+        # 多线程模式
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(upload_task, args) for args in tasks]
+            for future in as_completed(futures):
+                pass  # 日志已在 upload_file 输出，无需另加
 
     end_time = time.time()
     print(f"\n✅ 上传完成，用时 {end_time - start_time:.1f} 秒，共上传 {total_files} 个文件。")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="🧩 IAGON 递归上传器 v0.3")
+    parser = argparse.ArgumentParser(description="IAGON 递归上传器 并发支持版")
     parser.add_argument("--dir", required=True, help="本地目录路径（将被递归上传）")
     parser.add_argument("--visibility", choices=["private", "public"], default="private", help="文件可见性")
     parser.add_argument("--password", help="若 visibility=private，必须提供密码")
+    parser.add_argument("--workers", type=int, default=1, help="并行上传线程数，默认1（单线程）")
     args = parser.parse_args()
 
     if args.visibility == "private" and not args.password:
@@ -112,4 +129,4 @@ if __name__ == "__main__":
     if not os.path.isdir(args.dir):
         raise RuntimeError(f"❌ 指定路径无效或不是目录: {args.dir}")
 
-    recursive_upload(args.dir, args.visibility, args.password)
+    recursive_upload(args.dir, args.visibility, args.password, args.workers)
